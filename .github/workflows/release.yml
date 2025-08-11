@@ -1,0 +1,293 @@
+name: release.yml
+
+
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options: [patch, minor, major]
+      build_mode:
+        description: 'Python runtime for build (latest=3.x or pinned exact version)'
+        required: true
+        default: 'latest'
+        type: choice
+        options: [latest, pinned]
+      pinned_python_version:
+        description: 'Exact Python when build_mode=pinned (e.g., 3.10.13)'
+        required: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Pre-release verify (lint+tests+security)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install -e .
+          pip install flake8 pytest-cov bandit safety
+      - name: Lint
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Tests
+        run: |
+          python -m unittest discover -s . -p "test_*.py" -v
+          pytest --cov=main --cov-report=xml --cov-report=term-missing
+      - name: Security
+        run: |
+          bandit -r . -f txt || true
+          safety check || true
+  bump-and-tag:
+    needs: verify
+    runs-on: ubuntu-latest
+    outputs:
+      new_version: ${{ steps.version.outputs.new_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install bump2version
+        run: pip install bump2version==1.0.1
+
+      - name: Configure git
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Resolve bump type
+        id: bump_type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version_bump }}" ]; then
+            echo "bump_type=${{ github.event.inputs.version_bump }}" >> "$GITHUB_OUTPUT"
+          elif git log --format=%B -n 10 | grep -Ei "^(BREAKING|breaking):" -m1; then
+            echo "bump_type=major" >> "$GITHUB_OUTPUT"
+          elif git log --format=%B -n 10 | grep -Ei "^(feat|feature):" -m1; then
+            echo "bump_type=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump_type=patch" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bump version & tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          CURRENT_VERSION=$(python -c "import sys; sys.path.insert(0, '.'); import main; print(main.__version__)")
+          echo "Current: $CURRENT_VERSION"
+
+          # Write .bumpversion.cfg safely (no heredoc indentation issues)
+          printf "%s\n" \
+            "[bumpversion]" \
+            "current_version = ${CURRENT_VERSION}" \
+            "commit = False" \
+            "tag = False" \
+            "" \
+            "[bumpversion:file:main.py]" \
+            'search = __version__ = "{current_version}"' \
+            'replace = __version__ = "{new_version}"' \
+            > .bumpversion.cfg
+          
+          bumpversion "${{ steps.bump_type.outputs.bump_type }}"
+          NEW_VERSION=$(python -c "import sys; sys.path.insert(0, '.'); import main; print(main.__version__)")
+          echo "New: $NEW_VERSION"
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+          git add main.py
+          git commit -m "chore: bump version $CURRENT_VERSION -> $NEW_VERSION" || echo "No changes to commit"
+          git tag -a "v$NEW_VERSION" -m "Release v$NEW_VERSION"
+          git push origin main
+          git push origin --tags
+
+  build-and-release:
+    needs: bump-and-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve Python version
+        id: pyver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.build_mode }}" = "pinned" ] && [ -n "${{ github.event.inputs.pinned_python_version }}" ]; then
+            echo "version=${{ github.event.inputs.pinned_python_version }}" >> "$GITHUB_OUTPUT"
+            echo "mode=pinned-input" >> "$GITHUB_OUTPUT"
+          elif [ -f .python-version ]; then
+            echo "version=$(tr -d ' \n\r' < .python-version)" >> "$GITHUB_OUTPUT"
+            echo "mode=pinned-file" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=3.x" >> "$GITHUB_OUTPUT"
+            echo "mode=latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ steps.pyver.outputs.version }}
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          if [ "${{ steps.pyver.outputs.mode }}" = "latest" ]; then
+            pip install -r requirements.txt || true
+          else
+            if [ -f requirements.lock.txt ]; then
+              pip install --require-hashes -r requirements.lock.txt
+            else
+              pip install -r requirements.txt || true
+            fi
+          fi
+      - name: Build wheel
+        run: |
+          python -m build
+          twine check dist/*
+          ls -la dist/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-package-${{ needs.bump-and-tag.outputs.new_version }}-main
+          path: dist/
+          retention-days: 90
+
+      - name: Create GitHub Release (attach wheels)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.bump-and-tag.outputs.new_version }}
+          name: "Release v${{ needs.bump-and-tag.outputs.new_version }}"
+          body: |
+            Verified on Python 3.9–3.12; built on ${{ steps.pyver.outputs.version }} (mode=${{ steps.pyver.outputs.mode }}).
+            Artifacts are attached below and serve as the designated storage for this release.
+          files: dist/*
+
+  publish-artifacts:
+    name: Publish to S3 / Artifactory (optional)
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute artifact name
+        id: art
+        run: echo "name=python-package-${{ needs.bump-and-tag.outputs.new_version }}-main" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact artifact
+        id: dl_exact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.art.outputs.name }}
+          path: dist/
+          merge-multiple: false
+
+      - name: "Fallback: download by pattern (main only)"
+        if: ${{ steps.dl_exact.outcome != 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-package-*-main
+          path: dist/
+          merge-multiple: true
+
+      - name: Ensure dist path
+        run: |
+          mkdir -p dist
+          shopt -s nullglob
+          for f in *.whl *.tar.gz; do mv "$f" dist/; done
+      - name: Set publish flags
+        id: flags
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          ARTIFACTORY_URL: ${{ secrets.ARTIFACTORY_URL }}
+          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+        shell: bash
+        run: |
+          if [ -n "$AWS_ROLE_TO_ASSUME" ] && [ -n "$AWS_REGION" ] && [ -n "$S3_BUCKET" ]; then
+            echo "aws=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "aws=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$ARTIFACTORY_URL" ] && [ -n "$ARTIFACTORY_USER" ] && [ -n "$ARTIFACTORY_TOKEN" ]; then
+            echo "art=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "art=false" >> "$GITHUB_OUTPUT"
+          fi
+      # --- S3 real upload ---
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ steps.flags.outputs.aws == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload to S3
+        if: ${{ steps.flags.outputs.aws == 'true' }}
+        run: |
+          aws s3 cp dist/ s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ needs.bump-and-tag.outputs.new_version }}/ --recursive
+          echo "Uploaded wheels to s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ needs.bump-and-tag.outputs.new_version }}/"
+      # --- S3 placeholder (no secrets) ---
+      - name: S3 placeholder (no secrets)
+        if: ${{ steps.flags.outputs.aws == 'false' }}
+        run: |
+          echo "No S3 credentials found. Skipping S3 upload."
+          ls -la dist/
+      # --- Artifactory real upload ---
+      - name: Upload to Artifactory
+        if: ${{ steps.flags.outputs.art == 'true' }}
+        env:
+          URL: ${{ secrets.ARTIFACTORY_URL }}
+          USER: ${{ secrets.ARTIFACTORY_USER }}
+          TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+        run: |
+          for f in dist/*; do
+            curl -fsSL -u "$USER:$TOKEN" -T "$f" "$URL/python-local/msd-pipeline-hw/${{ needs.bump-and-tag.outputs.new_version }}/"
+          done
+          echo "Uploaded wheels to Artifactory: $URL/python-local/msd-pipeline-hw/${{ needs.bump-and-tag.outputs.new_version }}/"
+      # --- Artifactory placeholder (no secrets) ---
+      - name: Artifactory placeholder (no secrets)
+        if: ${{ steps.flags.outputs.art == 'false' }}
+        run: |
+          echo "No Artifactory credentials found. Skipping Artifactory upload."
+          ls -la dist/
