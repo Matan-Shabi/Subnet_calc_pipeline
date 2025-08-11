@@ -1,3 +1,6 @@
+[![PR workflow](https://github.com/Matan-Shabi/msd-pipeline-hw/actions/workflows/pr.yml/badge.svg)](https://github.com/Matan-Shabi/Subnet_calc_pipeline/actions/workflows/pr.yml)
+[![Release workflow](https://github.com/Matan-Shabi/msd-pipeline-hw/actions/workflows/release.yml/badge.svg)](https://github.com/Matan-Shabi/Subnet_calc_pipeline/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 # MSD Pipeline Homework - CI/CD Implementation
 
 A complete CI/CD pipeline implementation for a Python project using GitHub Actions, demonstrating best practices for Pull Request workflows and Release automation.
