@@ -3,7 +3,7 @@ Simple Calculator Application
 A basic calculator with add, subtract, multiply, and divide operations.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 class Calculator:
