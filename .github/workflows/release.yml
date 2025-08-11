@@ -205,12 +205,19 @@ jobs:
 
   publish-artifacts:
     name: Publish to S3 / Artifactory (optional)
-    needs: build-and-release
+    needs: [bump-and-tag, build-and-release]
     runs-on: ubuntu-latest
     steps:
       - name: Compute artifact name
         id: art
-        run: echo "name=python-package-${{ needs.bump-and-tag.outputs.new_version }}-main" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION="${{ needs.bump-and-tag.outputs.new_version }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="demo-1.0.0"
+            echo "Using fallback version for demo: $VERSION"
+          fi
+          echo "name=python-package-$VERSION-main" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Download exact artifact
         id: dl_exact
@@ -265,8 +272,8 @@ jobs:
       - name: Upload to S3
         if: ${{ steps.flags.outputs.aws == 'true' }}
         run: |
-          aws s3 cp dist/ s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ needs.bump-and-tag.outputs.new_version }}/ --recursive
-          echo "Uploaded wheels to s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ needs.bump-and-tag.outputs.new_version }}/"
+          aws s3 cp dist/ s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ steps.art.outputs.version }}/ --recursive
+          echo "Uploaded wheels to s3://${{ secrets.S3_BUCKET }}/msd-pipeline-hw/v${{ steps.art.outputs.version }}/"
       # --- S3 placeholder (no secrets) ---
       - name: S3 placeholder (no secrets)
         if: ${{ steps.flags.outputs.aws == 'false' }}
@@ -282,9 +289,9 @@ jobs:
           TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
         run: |
           for f in dist/*; do
-            curl -fsSL -u "$USER:$TOKEN" -T "$f" "$URL/python-local/msd-pipeline-hw/${{ needs.bump-and-tag.outputs.new_version }}/"
+            curl -fsSL -u "$USER:$TOKEN" -T "$f" "$URL/python-local/msd-pipeline-hw/${{ steps.art.outputs.version }}/"
           done
-          echo "Uploaded wheels to Artifactory: $URL/python-local/msd-pipeline-hw/${{ needs.bump-and-tag.outputs.new_version }}/"
+          echo "Uploaded wheels to Artifactory: $URL/python-local/msd-pipeline-hw/${{ steps.art.outputs.version }}/"
       # --- Artifactory placeholder (no secrets) ---
       - name: Artifactory placeholder (no secrets)
         if: ${{ steps.flags.outputs.art == 'false' }}
